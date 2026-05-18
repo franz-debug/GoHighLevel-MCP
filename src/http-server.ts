@@ -702,9 +702,15 @@ class GHLMCPHttpServer {
     console.log('=========================================');
     
     try {
-      // Test GHL API connection
-      await this.testGHLConnection();
-      
+      // In OAuth mode there is no single API key to test (tokens are
+      // resolved per-request from Supabase). Only run the legacy
+      // connection test if a static GHL_API_KEY is configured.
+      if (process.env.GHL_API_KEY) {
+        await this.testGHLConnection();
+      } else {
+        console.log('[GHL MCP HTTP] Skipping startup GHL connection test (OAuth-only mode).');
+      }
+
       // Start HTTP server
       this.app.listen(this.port, '0.0.0.0', () => {
         console.log('✅ GoHighLevel MCP HTTP Server started successfully!');
