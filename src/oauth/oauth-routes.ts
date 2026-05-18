@@ -40,18 +40,44 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    // GHL's /oauth/chooselocation endpoint only works for agency-distribution
-    // apps. For Sub-Account distribution apps it just dumps the user at the
-    // dashboard. The reliable cross-distribution-type entry point is the
-    // marketplace listing page itself — GHL's own Install button there
-    // routes through the correct OAuth flow for whatever distribution type
-    // is configured on the app.
-    //
-    // The marketplace app ID is the part of the client_id before the dash.
-    // e.g. "6a0ae77f03a61082247120da-mpb23zpr" -> "6a0ae77f03a61082247120da"
+    // GHL's canonical install URL format (matches what they generate for the
+    // Install link in app settings). Critical bits:
+    //   - Path is /v2/oauth/chooselocation (NOT /oauth/chooselocation — the
+    //     v1 path only works for agency-distribution apps and dumps
+    //     sub-account apps at the dashboard)
+    //   - version_id is required (the published version of the app to
+    //     install — defaults to the app_id when there's only one version)
+    const redirectUri = getRedirectUri(req);
     const appId = clientId.split('-')[0];
-    const installUrl = `https://marketplace.gohighlevel.com/apps/${appId}`;
-    res.redirect(installUrl);
+    const versionId = process.env.GHL_VERSION_ID || appId;
+
+    const scope = [
+      'contacts.readonly',
+      'contacts.write',
+      'conversations.readonly',
+      'conversations.write',
+      'conversations/message.readonly',
+      'conversations/message.write',
+      'opportunities.readonly',
+      'opportunities.write',
+      'calendars.readonly',
+      'calendars.write',
+      'calendars/events.readonly',
+      'calendars/events.write',
+      'locations.readonly',
+      'users.readonly',
+      'workflows.readonly',
+      'campaigns.readonly',
+    ].join(' ');
+
+    const url = new URL('https://marketplace.gohighlevel.com/v2/oauth/chooselocation');
+    url.searchParams.set('response_type', 'code');
+    url.searchParams.set('client_id', clientId);
+    url.searchParams.set('redirect_uri', redirectUri);
+    url.searchParams.set('scope', scope);
+    url.searchParams.set('version_id', versionId);
+
+    res.redirect(url.toString());
   };
 
   /**
