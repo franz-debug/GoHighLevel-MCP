@@ -4,6 +4,8 @@
  */
 
 import axios, { AxiosInstance, AxiosResponse, AxiosError } from 'axios';
+import { getActiveLocationId } from '../oauth/request-context';
+import { getValidAccessToken } from '../oauth/token-manager';
 import {
   GHLConfig,
   GHLContact,
@@ -392,7 +394,19 @@ export class GHLApiClient {
   private config: GHLConfig;
 
   constructor(config: GHLConfig) {
-    this.config = config;
+    // Wrap config in a Proxy: any read of .locationId returns the OAuth
+    // context's location_id when one is active, otherwise the static value.
+    // This means all 150+ existing call sites that use this.config.locationId
+    // automatically become multi-tenant aware.
+    this.config = new Proxy(config, {
+      get(target, prop, receiver) {
+        if (prop === 'locationId') {
+          const ctxLoc = getActiveLocationId();
+          if (ctxLoc) return ctxLoc;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
     
     // Create axios instance with base configuration
     this.axiosInstance = axios.create({
@@ -406,11 +420,28 @@ export class GHLApiClient {
       timeout: 30000 // 30 second timeout
     });
 
-    // Add request interceptor for logging
+    // Add request interceptor — resolves OAuth token per-request from
+    // Supabase when a location context is active, falling back to the
+    // static config.accessToken otherwise.
     this.axiosInstance.interceptors.request.use(
-      (config) => {
-        process.stderr.write(`[GHL API] ${config.method?.toUpperCase()} ${config.url}\n`);
-        return config;
+      async (reqConfig) => {
+        const activeLocationId = getActiveLocationId();
+        if (activeLocationId) {
+          try {
+            const token = await getValidAccessToken(activeLocationId);
+            reqConfig.headers = reqConfig.headers ?? {};
+            (reqConfig.headers as any)['Authorization'] = `Bearer ${token}`;
+            // Also override locationId in any payload that needs it
+            (reqConfig as any)._activeLocationId = activeLocationId;
+          } catch (err: any) {
+            process.stderr.write(
+              `[GHL API] OAuth token lookup failed for ${activeLocationId}: ${err?.message}\n`
+            );
+            throw err;
+          }
+        }
+        process.stderr.write(`[GHL API] ${reqConfig.method?.toUpperCase()} ${reqConfig.url}\n`);
+        return reqConfig;
       },
       (error) => {
         console.error('[GHL API] Request error:', error);

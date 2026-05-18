@@ -34,6 +34,8 @@ import { SurveyTools } from './tools/survey-tools';
 import { StoreTools } from './tools/store-tools';
 import { ProductsTools } from './tools/products-tools.js';
 import { GHLConfig } from './types/ghl-types';
+import { createOAuthRouter } from './oauth/oauth-routes';
+import { runWithContext } from './oauth/request-context';
 
 // Load environment variables
 dotenv.config();
@@ -146,12 +148,14 @@ class GHLMCPHttpServer {
     };
 
     // Validate required configuration
+    // NOTE: With OAuth, GHL_API_KEY and GHL_LOCATION_ID are optional —
+    // tokens are resolved per-request from Supabase. We log a warning
+    // instead of throwing so the server can boot in OAuth-only mode.
     if (!config.accessToken) {
-      throw new Error('GHL_API_KEY environment variable is required');
+      console.warn('[GHL MCP HTTP] GHL_API_KEY not set — running in OAuth-only mode. Static API key fallback is disabled.');
     }
-
     if (!config.locationId) {
-      throw new Error('GHL_LOCATION_ID environment variable is required');
+      console.warn('[GHL MCP HTTP] GHL_LOCATION_ID not set — running in OAuth-only mode. Default location is unset.');
     }
 
     console.log('[GHL MCP HTTP] Initializing GHL API client...');
@@ -296,6 +300,9 @@ class GHLMCPHttpServer {
    * Setup HTTP routes
    */
   private setupRoutes(): void {
+    // OAuth install/callback routes — must come BEFORE generic handlers
+    this.app.use(createOAuthRouter());
+
     // Health check endpoint
     this.app.get('/health', (req, res) => {
       res.json({ 
@@ -350,35 +357,43 @@ class GHLMCPHttpServer {
       }
     });
 
-    // SSE endpoint for ChatGPT MCP connection
+    // SSE endpoint for MCP connections.
+    // Each Claude Desktop config entry connects with ?location_id=<sub_account_id>,
+    // which we extract here and propagate via AsyncLocalStorage so the GHL
+    // API client knows which OAuth token to use.
     const handleSSE = async (req: express.Request, res: express.Response) => {
       const sessionId = req.query.sessionId || 'unknown';
-      console.log(`[GHL MCP HTTP] New SSE connection from: ${req.ip}, sessionId: ${sessionId}, method: ${req.method}`);
-      
-      try {
-        // Create SSE transport (this will set the headers)
-        const transport = new SSEServerTransport('/sse', res);
-        
-        // Connect MCP server to transport
-        await this.server.connect(transport);
-        
-        console.log(`[GHL MCP HTTP] SSE connection established for session: ${sessionId}`);
-        
-        // Handle client disconnect
-        req.on('close', () => {
-          console.log(`[GHL MCP HTTP] SSE connection closed for session: ${sessionId}`);
-        });
-        
-      } catch (error) {
-        console.error(`[GHL MCP HTTP] SSE connection error for session ${sessionId}:`, error);
-        
-        // Only send error response if headers haven't been sent yet
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Failed to establish SSE connection' });
-        } else {
-          // If headers were already sent, close the connection
-          res.end();
+      const locationId = (req.query.location_id as string | undefined) || undefined;
+      console.log(`[GHL MCP HTTP] New SSE connection from: ${req.ip}, sessionId: ${sessionId}, method: ${req.method}, locationId: ${locationId ?? 'none (legacy mode)'}`);
+
+      const runInner = async () => {
+        try {
+          // Create SSE transport (this will set the headers)
+          const transport = new SSEServerTransport('/sse', res);
+
+          // Connect MCP server to transport
+          await this.server.connect(transport);
+
+          console.log(`[GHL MCP HTTP] SSE connection established for session: ${sessionId}`);
+
+          // Handle client disconnect
+          req.on('close', () => {
+            console.log(`[GHL MCP HTTP] SSE connection closed for session: ${sessionId}`);
+          });
+        } catch (error) {
+          console.error(`[GHL MCP HTTP] SSE connection error for session ${sessionId}:`, error);
+          if (!res.headersSent) {
+            res.status(500).json({ error: 'Failed to establish SSE connection' });
+          } else {
+            res.end();
+          }
         }
+      };
+
+      if (locationId) {
+        await runWithContext({ locationId }, runInner);
+      } else {
+        await runInner();
       }
     };
 
