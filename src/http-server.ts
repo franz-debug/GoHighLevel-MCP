@@ -7,6 +7,7 @@ import express from 'express';
 import cors from 'cors';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { 
   CallToolRequestSchema,
   ErrorCode,
@@ -169,9 +170,10 @@ class GHLMCPHttpServer {
   /**
    * Setup MCP request handlers
    */
-  private setupMCPHandlers(): void {
+  private setupMCPHandlers(targetServer?: Server): void {
+    const server = targetServer ?? this.server;
     // Handle list tools requests
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
       console.log('[GHL MCP HTTP] Listing available tools...');
       
       try {
@@ -228,7 +230,7 @@ class GHLMCPHttpServer {
     });
 
     // Handle tool execution requests
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       
       console.log(`[GHL MCP HTTP] Executing tool: ${name}`);
@@ -400,6 +402,58 @@ class GHLMCPHttpServer {
     // Handle both GET and POST for SSE (MCP protocol requirements)
     this.app.get('/sse', handleSSE);
     this.app.post('/sse', handleSSE);
+
+    // Streamable HTTP transport (modern MCP spec — used by Claude Desktop's
+    // "custom connector" UI). Stateless: a fresh Server + Transport per request.
+    // We reuse the existing tool instances (they're thin stateless wrappers
+    // around the GHL API client), but build a new Server so handlers route
+    // to this specific transport.
+    const handleStreamableHTTP = async (req: express.Request, res: express.Response) => {
+      const locationId = (req.query.location_id as string | undefined) || undefined;
+      console.log(`[MCP/streamable] ${req.method} location_id=${locationId ?? 'none'}`);
+
+      const runInner = async () => {
+        let transport: StreamableHTTPServerTransport | undefined;
+        try {
+          const perRequestServer = new Server(
+            { name: 'ghl-mcp-server', version: '1.0.0' },
+            { capabilities: { tools: {} } }
+          );
+          this.setupMCPHandlers(perRequestServer);
+
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined, // stateless: no session tracking
+          });
+
+          res.on('close', () => {
+            transport?.close();
+            perRequestServer.close();
+          });
+
+          await perRequestServer.connect(transport);
+          await transport.handleRequest(req, res, req.body);
+        } catch (error) {
+          console.error('[MCP/streamable] Error:', error);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: null,
+            });
+          }
+        }
+      };
+
+      if (locationId) {
+        await runWithContext({ locationId }, runInner);
+      } else {
+        await runInner();
+      }
+    };
+
+    this.app.post('/mcp', handleStreamableHTTP);
+    this.app.get('/mcp', handleStreamableHTTP);
+    this.app.delete('/mcp', handleStreamableHTTP);
 
     // Root endpoint with server info
     this.app.get('/', (req, res) => {
