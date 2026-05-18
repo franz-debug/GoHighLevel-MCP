@@ -57,29 +57,39 @@ export function createOAuthRouter(): Router {
     const appId = clientId.split('-')[0];
     const versionId = process.env.GHL_VERSION_ID || appId;
 
-    // oauth.readonly + oauth.write are required for the agency token to be
-    // exchangeable for location tokens via /oauth/locationToken.
-    const baseScopes = [
-      'contacts.readonly',
-      'contacts.write',
-      'conversations.readonly',
-      'conversations.write',
-      'conversations/message.readonly',
-      'conversations/message.write',
-      'opportunities.readonly',
-      'opportunities.write',
-      'calendars.readonly',
-      'calendars.write',
-      'calendars/events.readonly',
-      'calendars/events.write',
-      'locations.readonly',
-      'users.readonly',
-      'workflows.readonly',
+    // Match the exact scope set your GHL app actually has registered.
+    // Overridable via GHL_SCOPES env var (space-separated list) for flexibility.
+    // Default uses the scope list extracted from the app's auto-generated
+    // install URL — these are the scopes you selected when configuring the app.
+    const defaultScopes = [
+      'contacts.readonly', 'contacts.write',
+      'conversations.readonly', 'conversations.write',
+      'conversations/message.readonly', 'conversations/message.write',
+      'conversations/reports.readonly', 'conversations/livechat.write',
+      'opportunities.readonly', 'opportunities.write',
+      'calendars.readonly', 'calendars.write',
+      'calendars/events.readonly', 'calendars/events.write',
+      'calendars/groups.readonly', 'calendars/groups.write',
+      'calendars/resources.readonly', 'calendars/resources.write',
+      'businesses.readonly', 'businesses.write',
       'campaigns.readonly',
-      'oauth.readonly',
-      'oauth.write',
+      'companies.readonly',
+      'forms.readonly', 'forms.write',
+      'links.readonly', 'links.write',
+      'locations.readonly', 'locations.write',
+      'locations/customFields.readonly', 'locations/customFields.write',
+      'locations/customValues.readonly', 'locations/customValues.write',
+      'locations/tasks.readonly', 'locations/tasks.write',
+      'locations/tags.readonly', 'locations/tags.write',
+      'locations/templates.readonly',
+      'medias.readonly', 'medias.write',
+      'products.readonly', 'products.write',
+      'products/prices.readonly', 'products/prices.write',
+      'snapshots.readonly', 'snapshots.write',
+      'users.readonly', 'users.write',
+      'workflows.readonly',
     ];
-    const scope = baseScopes.join(' ');
+    const scope = (process.env.GHL_SCOPES || defaultScopes.join(' '));
 
     const url = new URL('https://marketplace.gohighlevel.com/v2/oauth/chooselocation');
     url.searchParams.set('response_type', 'code');
