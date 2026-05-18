@@ -10,8 +10,6 @@ import { Router, Request, Response, RequestHandler } from 'express';
 import { exchangeCodeForTokens, persistToken } from './token-manager';
 import { listLocations } from './supabase-client';
 
-const GHL_AUTHORIZE_URL = 'https://marketplace.gohighlevel.com/oauth/chooselocation';
-
 /**
  * Build the absolute redirect_uri based on either the configured BASE_URL
  * env var (used in production on Railway) or the inbound request host
@@ -42,37 +40,18 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    const redirectUri = getRedirectUri(req);
-
-    // We send a broad scope set; GHL will only honor the ones actually
-    // enabled on the Marketplace app. Listing them all here is safe and
-    // means we don't have to redeploy when scopes are tweaked in the UI.
-    const scope = [
-      'contacts.readonly',
-      'contacts.write',
-      'conversations.readonly',
-      'conversations.write',
-      'conversations/message.readonly',
-      'conversations/message.write',
-      'opportunities.readonly',
-      'opportunities.write',
-      'calendars.readonly',
-      'calendars.write',
-      'calendars/events.readonly',
-      'calendars/events.write',
-      'locations.readonly',
-      'users.readonly',
-      'workflows.readonly',
-      'campaigns.readonly',
-    ].join(' ');
-
-    const url = new URL(GHL_AUTHORIZE_URL);
-    url.searchParams.set('response_type', 'code');
-    url.searchParams.set('client_id', clientId);
-    url.searchParams.set('redirect_uri', redirectUri);
-    url.searchParams.set('scope', scope);
-
-    res.redirect(url.toString());
+    // GHL's /oauth/chooselocation endpoint only works for agency-distribution
+    // apps. For Sub-Account distribution apps it just dumps the user at the
+    // dashboard. The reliable cross-distribution-type entry point is the
+    // marketplace listing page itself — GHL's own Install button there
+    // routes through the correct OAuth flow for whatever distribution type
+    // is configured on the app.
+    //
+    // The marketplace app ID is the part of the client_id before the dash.
+    // e.g. "6a0ae77f03a61082247120da-mpb23zpr" -> "6a0ae77f03a61082247120da"
+    const appId = clientId.split('-')[0];
+    const installUrl = `https://marketplace.gohighlevel.com/apps/${appId}`;
+    res.redirect(installUrl);
   };
 
   /**
