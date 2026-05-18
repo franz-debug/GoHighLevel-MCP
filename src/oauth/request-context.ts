@@ -16,6 +16,10 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 export interface RequestContext {
   /** The GHL sub-account this request is targeting. */
   locationId: string;
+  /** The API key id authenticating this request (for audit log). */
+  apiKeyId?: string;
+  /** The API key name (human label, for audit log). */
+  apiKeyName?: string;
 }
 
 const storage = new AsyncLocalStorage<RequestContext>();

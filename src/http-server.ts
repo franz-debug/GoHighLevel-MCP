@@ -36,7 +36,11 @@ import { StoreTools } from './tools/store-tools';
 import { ProductsTools } from './tools/products-tools.js';
 import { GHLConfig } from './types/ghl-types';
 import { createOAuthRouter } from './oauth/oauth-routes';
-import { runWithContext } from './oauth/request-context';
+import { runWithContext, getRequestContext } from './oauth/request-context';
+import { createAdminRouter } from './auth/admin-routes';
+import { requireApiKey } from './auth/auth-middleware';
+import { writeAuditEntry } from './auth/key-storage';
+import rateLimit from 'express-rate-limit';
 
 // Load environment variables
 dotenv.config();
@@ -232,8 +236,10 @@ class GHLMCPHttpServer {
     // Handle tool execution requests
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
-      
-      console.log(`[GHL MCP HTTP] Executing tool: ${name}`);
+      const startedAt = Date.now();
+      const ctx = getRequestContext();
+
+      console.log(`[GHL MCP HTTP] Executing tool: ${name} (location=${ctx?.locationId ?? 'unknown'}, key=${ctx?.apiKeyName ?? 'unknown'})`);
 
       try {
         let result: any;
@@ -278,7 +284,18 @@ class GHLMCPHttpServer {
         }
         
         console.log(`[GHL MCP HTTP] Tool ${name} executed successfully`);
-        
+
+        // Audit: successful call (fire and forget)
+        writeAuditEntry({
+          api_key_id: ctx?.apiKeyId ?? null,
+          api_key_name: ctx?.apiKeyName ?? null,
+          location_id: ctx?.locationId ?? null,
+          tool_name: name,
+          success: true,
+          error_message: null,
+          duration_ms: Date.now() - startedAt,
+        });
+
         return {
           content: [
             {
@@ -287,9 +304,20 @@ class GHLMCPHttpServer {
             }
           ]
         };
-      } catch (error) {
+      } catch (error: any) {
         console.error(`[GHL MCP HTTP] Error executing tool ${name}:`, error);
-        
+
+        // Audit: failed call
+        writeAuditEntry({
+          api_key_id: ctx?.apiKeyId ?? null,
+          api_key_name: ctx?.apiKeyName ?? null,
+          location_id: ctx?.locationId ?? null,
+          tool_name: name,
+          success: false,
+          error_message: String(error?.message ?? error).slice(0, 500),
+          duration_ms: Date.now() - startedAt,
+        });
+
         throw new McpError(
           ErrorCode.InternalError,
           `Tool execution failed: ${error}`
@@ -302,7 +330,27 @@ class GHLMCPHttpServer {
    * Setup HTTP routes
    */
   private setupRoutes(): void {
-    // OAuth install/callback routes — must come BEFORE generic handlers
+    // Per-IP rate limit on the public/auth surface to slow down anyone
+    // who tries to brute-force keys. Per-key rate limiting is applied
+    // separately to /mcp and /sse below.
+    const publicSurfaceLimiter = rateLimit({
+      windowMs: 60_000,
+      limit: 30,
+      standardHeaders: 'draft-7',
+      legacyHeaders: false,
+      message: { error: 'rate_limited', message: 'Too many requests.' },
+    });
+
+    // Admin endpoints — auth handled internally via ADMIN_API_KEY
+    this.app.use(createAdminRouter());
+
+    // Auth-protect specific OAuth endpoints. /oauth/callback MUST stay
+    // public so GHL can hit it; /oauth/install and /oauth/locations are
+    // sensitive and now require an API key.
+    this.app.get('/oauth/install', publicSurfaceLimiter, requireApiKey, (req, res, next) => next());
+    this.app.get('/oauth/locations', publicSurfaceLimiter, requireApiKey, (req, res, next) => next());
+
+    // OAuth install/callback routes (callback remains public via the router)
     this.app.use(createOAuthRouter());
 
     // Health check endpoint
@@ -393,15 +441,27 @@ class GHLMCPHttpServer {
       };
 
       if (locationId) {
-        await runWithContext({ locationId }, runInner);
+        await runWithContext({ locationId, apiKeyId: req.apiAuth?.keyId, apiKeyName: req.apiAuth?.keyName }, runInner);
       } else {
         await runInner();
       }
     };
 
-    // Handle both GET and POST for SSE (MCP protocol requirements)
-    this.app.get('/sse', handleSSE);
-    this.app.post('/sse', handleSSE);
+    // Per-API-key rate limiter for MCP traffic — keyed by API key id
+    // (set by requireApiKey middleware on req.auth) so each user gets
+    // their own bucket.
+    const mcpLimiter = rateLimit({
+      windowMs: 60_000,
+      limit: 60,
+      keyGenerator: (req) => (req as any).apiAuth?.keyId ?? req.ip ?? 'anon',
+      standardHeaders: 'draft-7',
+      legacyHeaders: false,
+      message: { error: 'rate_limited', message: 'Too many MCP requests.' },
+    });
+
+    // Handle both GET and POST for SSE (MCP protocol requirements) — auth-protected
+    this.app.get('/sse', requireApiKey, mcpLimiter, handleSSE);
+    this.app.post('/sse', requireApiKey, mcpLimiter, handleSSE);
 
     // Streamable HTTP transport (modern MCP spec — used by Claude Desktop's
     // "custom connector" UI). Stateless: a fresh Server + Transport per request.
@@ -445,15 +505,15 @@ class GHLMCPHttpServer {
       };
 
       if (locationId) {
-        await runWithContext({ locationId }, runInner);
+        await runWithContext({ locationId, apiKeyId: req.apiAuth?.keyId, apiKeyName: req.apiAuth?.keyName }, runInner);
       } else {
         await runInner();
       }
     };
 
-    this.app.post('/mcp', handleStreamableHTTP);
-    this.app.get('/mcp', handleStreamableHTTP);
-    this.app.delete('/mcp', handleStreamableHTTP);
+    this.app.post('/mcp', requireApiKey, mcpLimiter, handleStreamableHTTP);
+    this.app.get('/mcp', requireApiKey, mcpLimiter, handleStreamableHTTP);
+    this.app.delete('/mcp', requireApiKey, mcpLimiter, handleStreamableHTTP);
 
     // Root endpoint with server info
     this.app.get('/', (req, res) => {
