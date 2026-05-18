@@ -7,7 +7,13 @@
  */
 
 import { Router, Request, Response, RequestHandler } from 'express';
-import { exchangeCodeForTokens, persistToken } from './token-manager';
+import {
+  exchangeCodeForTokens,
+  exchangeCodeForAgencyTokens,
+  persistToken,
+  backfillAllLocations,
+  BackfillResult,
+} from './token-manager';
 import { listLocations } from './supabase-client';
 
 /**
@@ -40,18 +46,20 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    // GHL's canonical install URL format (matches what they generate for the
-    // Install link in app settings). Critical bits:
-    //   - Path is /v2/oauth/chooselocation (NOT /oauth/chooselocation — the
-    //     v1 path only works for agency-distribution apps and dumps
-    //     sub-account apps at the dashboard)
-    //   - version_id is required (the published version of the app to
-    //     install — defaults to the app_id when there's only one version)
+    // Two install modes:
+    //   - default: per-sub-account install (one OAuth code -> one location token)
+    //   - ?as=agency: agency-level install (one OAuth code -> agency token ->
+    //     auto-backfill location tokens for every sub-account where the app
+    //     is installed). This is the bulk-import path.
+    const asAgency = req.query.as === 'agency';
+
     const redirectUri = getRedirectUri(req);
     const appId = clientId.split('-')[0];
     const versionId = process.env.GHL_VERSION_ID || appId;
 
-    const scope = [
+    // oauth.readonly + oauth.write are required for the agency token to be
+    // exchangeable for location tokens via /oauth/locationToken.
+    const baseScopes = [
       'contacts.readonly',
       'contacts.write',
       'conversations.readonly',
@@ -68,7 +76,10 @@ export function createOAuthRouter(): Router {
       'users.readonly',
       'workflows.readonly',
       'campaigns.readonly',
-    ].join(' ');
+      'oauth.readonly',
+      'oauth.write',
+    ];
+    const scope = baseScopes.join(' ');
 
     const url = new URL('https://marketplace.gohighlevel.com/v2/oauth/chooselocation');
     url.searchParams.set('response_type', 'code');
@@ -76,6 +87,9 @@ export function createOAuthRouter(): Router {
     url.searchParams.set('redirect_uri', redirectUri);
     url.searchParams.set('scope', scope);
     url.searchParams.set('version_id', versionId);
+    // state is preserved across the OAuth round-trip; we use it to know
+    // which exchange flow to run when the code comes back.
+    if (asAgency) url.searchParams.set('state', 'agency');
 
     res.redirect(url.toString());
   };
@@ -88,6 +102,8 @@ export function createOAuthRouter(): Router {
   const callbackHandler: RequestHandler = async (req, res) => {
     const code = req.query.code as string | undefined;
     const error = req.query.error as string | undefined;
+    const state = req.query.state as string | undefined;
+    const isAgencyInstall = state === 'agency';
 
     if (error) {
       res.status(400).send(`<h1>Install cancelled</h1><p>GHL returned: ${error}</p>`);
@@ -100,6 +116,37 @@ export function createOAuthRouter(): Router {
 
     try {
       const redirectUri = getRedirectUri(req);
+
+      // AGENCY-LEVEL INSTALL: exchange for Company token, then bulk-backfill
+      if (isAgencyInstall) {
+        const agencyTokens = await exchangeCodeForAgencyTokens(code, redirectUri);
+        const result: BackfillResult = await backfillAllLocations(agencyTokens);
+
+        res.send(`
+          <html>
+            <head><title>Agency install complete</title></head>
+            <body style="font-family: -apple-system, sans-serif; max-width: 720px; margin: 60px auto; padding: 0 20px;">
+              <h1>Agency install complete</h1>
+              <p><strong>Company ID:</strong> <code>${agencyTokens.companyId}</code></p>
+              <h2>Backfill result</h2>
+              <ul>
+                <li><strong>Total locations enumerated:</strong> ${result.total}</li>
+                <li><strong>Successfully tokenized:</strong> ${result.succeeded}</li>
+                <li><strong>Failed:</strong> ${result.failed.length}</li>
+              </ul>
+              ${
+                result.failed.length > 0
+                  ? `<details><summary>Failures (${result.failed.length})</summary><pre>${JSON.stringify(result.failed, null, 2)}</pre></details>`
+                  : ''
+              }
+              <p>To see all installed sub-accounts, visit <a href="/oauth/locations">/oauth/locations</a>.</p>
+            </body>
+          </html>
+        `);
+        return;
+      }
+
+      // PER-SUB-ACCOUNT INSTALL: existing single-location flow
       const tokens = await exchangeCodeForTokens(code, redirectUri);
       await persistToken(tokens);
 

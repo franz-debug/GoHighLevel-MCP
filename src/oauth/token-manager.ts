@@ -135,3 +135,186 @@ export async function getValidAccessToken(locationId: string): Promise<string> {
   await persistToken(fresh, stored.location_name ?? undefined);
   return fresh.access_token;
 }
+
+
+/**
+ * Exchange an OAuth code for an Agency (Company) scope token.
+ * Used when the user installs the app at agency level — required to
+ * mint per-sub-account tokens via /oauth/locationToken later.
+ */
+export async function exchangeCodeForAgencyTokens(
+  code: string,
+  redirectUri: string
+): Promise<GHLTokenResponse> {
+  const clientId = process.env.GHL_CLIENT_ID;
+  const clientSecret = process.env.GHL_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error('GHL_CLIENT_ID and GHL_CLIENT_SECRET must be set');
+  }
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+    user_type: 'Company', // Agency-level token
+  });
+
+  const { data } = await axios.post<GHLTokenResponse>(GHL_TOKEN_URL, params, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Accept: 'application/json',
+    },
+  });
+
+  return data;
+}
+
+/**
+ * Shape of one row returned by /oauth/installedLocations.
+ */
+export interface InstalledLocation {
+  _id: string;
+  name?: string;
+  address?: string;
+  isInstalled?: boolean;
+}
+
+/**
+ * Enumerate all sub-accounts where this app is currently installed
+ * for the given company (agency). Requires an Agency-scope access token.
+ */
+export async function listInstalledLocations(
+  agencyAccessToken: string,
+  companyId: string,
+  appId: string
+): Promise<InstalledLocation[]> {
+  const out: InstalledLocation[] = [];
+  let skip = 0;
+  const limit = 100;
+
+  // Page through results until we get fewer than `limit` back.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const url = new URL('https://services.leadconnectorhq.com/oauth/installedLocations');
+    url.searchParams.set('companyId', companyId);
+    url.searchParams.set('appId', appId);
+    url.searchParams.set('limit', String(limit));
+    url.searchParams.set('skip', String(skip));
+
+    const { data } = await axios.get<{ locations: InstalledLocation[]; count?: number }>(
+      url.toString(),
+      {
+        headers: {
+          Authorization: `Bearer ${agencyAccessToken}`,
+          Version: '2021-07-28',
+          Accept: 'application/json',
+        },
+      }
+    );
+
+    const batch = data.locations ?? [];
+    out.push(...batch);
+    if (batch.length < limit) break;
+    skip += limit;
+    if (skip > 5000) break; // safety stop — 5000 sub-accounts is more than anyone should hit
+  }
+
+  return out;
+}
+
+/**
+ * Mint a Location (sub-account) access token for the given locationId,
+ * using the agency-scope token. Returns a GHLTokenResponse shape.
+ */
+export async function mintLocationTokenFromAgency(
+  agencyAccessToken: string,
+  companyId: string,
+  locationId: string
+): Promise<GHLTokenResponse> {
+  const params = new URLSearchParams({
+    companyId,
+    locationId,
+  });
+
+  const { data } = await axios.post<GHLTokenResponse>(
+    'https://services.leadconnectorhq.com/oauth/locationToken',
+    params,
+    {
+      headers: {
+        Authorization: `Bearer ${agencyAccessToken}`,
+        Version: '2021-07-28',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Accept: 'application/json',
+      },
+    }
+  );
+
+  return data;
+}
+
+/**
+ * Result of a bulk backfill operation.
+ */
+export interface BackfillResult {
+  total: number;
+  succeeded: number;
+  failed: { locationId: string; error: string }[];
+  locationIds: string[];
+}
+
+/**
+ * Given an Agency-scope access token, enumerate every installed
+ * sub-account and persist a Location-scope token for each.
+ * Returns a summary of successes/failures.
+ *
+ * Concurrency: 5 in-flight mint calls at a time — fast enough to backfill
+ * 200 accounts in ~30s but gentle on GHL's rate limits.
+ */
+export async function backfillAllLocations(agencyTokenResp: GHLTokenResponse): Promise<BackfillResult> {
+  const clientId = process.env.GHL_CLIENT_ID;
+  if (!clientId) throw new Error('GHL_CLIENT_ID must be set');
+  const appId = clientId.split('-')[0];
+
+  const locations = await listInstalledLocations(
+    agencyTokenResp.access_token,
+    agencyTokenResp.companyId,
+    appId
+  );
+
+  const result: BackfillResult = {
+    total: locations.length,
+    succeeded: 0,
+    failed: [],
+    locationIds: [],
+  };
+
+  const concurrency = 5;
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    while (cursor < locations.length) {
+      const loc = locations[cursor++];
+      try {
+        const tokenResp = await mintLocationTokenFromAgency(
+          agencyTokenResp.access_token,
+          agencyTokenResp.companyId,
+          loc._id
+        );
+        await persistToken(tokenResp, loc.name ?? undefined);
+        result.succeeded++;
+        result.locationIds.push(loc._id);
+      } catch (err: any) {
+        const msg = err?.response?.data?.message || err?.message || 'unknown error';
+        result.failed.push({ locationId: loc._id, error: String(msg).slice(0, 200) });
+        process.stderr.write(
+          `[OAuth] backfill failed for ${loc._id}: ${msg}\n`
+        );
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  return result;
+}
