@@ -1,26 +1,40 @@
-# Use Node.js 18 LTS
-FROM node:18-alpine
+# syntax=docker/dockerfile:1
 
-# Set working directory
+# ---------- Stage 1: build ----------
+# Install ALL dependencies (incl. devDependencies like typescript) and compile.
+FROM node:18-alpine AS builder
+
 WORKDIR /app
 
-# Copy package files
-COPY package*.json ./
+# Copy manifests first so this layer caches when source changes but deps don't
+COPY package.json package-lock.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Full install (including devDependencies — we need tsc to build)
+RUN npm ci
 
-# Copy source code
-COPY . .
+# Now bring in the source and compile
+COPY tsconfig.json ./
+COPY src ./src
 
-# Build the application
 RUN npm run build
 
-# Expose the port
-EXPOSE 8000
 
-# Set environment to production
+# ---------- Stage 2: runtime ----------
+# Slim image with only production deps and the compiled output.
+FROM node:18-alpine AS runner
+
+WORKDIR /app
+
 ENV NODE_ENV=production
 
-# Start the HTTP server
-CMD ["npm", "start"] 
+# Copy manifests and install ONLY production deps
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# Copy the build artifacts from the builder stage
+COPY --from=builder /app/dist ./dist
+
+EXPOSE 8000
+
+# Start the HTTP server (dist/http-server.js)
+CMD ["npm", "start"]
